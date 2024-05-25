@@ -94,30 +94,30 @@ class CPUForgetMult(torch.nn.Module):
 class GPUForgetMult(torch.autograd.Function):
     configured_gpus = {}
     ptx = None
-    def __init__(self):
-        super(GPUForgetMult, self).__init__()
 
-    def compile(self):
-        if self.ptx is None:
-            program = Program(kernel.encode(), 'recurrent_forget_mult.cu'.encode())
+    @staticmethod
+    def compile(ctx):
+        if GPUForgetMult.ptx is None:
+            program = Program(kernel, 'recurrent_forget_mult.cu')
             GPUForgetMult.ptx = program.compile()
 
         if torch.cuda.current_device() not in GPUForgetMult.configured_gpus:
             m = function.Module()
-            m.load(bytes(self.ptx.encode()))
+            m.load(bytes(GPUForgetMult.ptx.encode()))
 
-            self.forget_mult = m.get_function('recurrent_forget_mult')
-            self.bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
+            ctx.forget_mult = m.get_function('recurrent_forget_mult')
+            ctx.bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
 
             Stream = namedtuple('Stream', ['ptr'])
-            self.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+            ctx.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
 
-            GPUForgetMult.configured_gpus[torch.cuda.current_device()] = (self.forget_mult, self.bwd_forget_mult, self.stream)
+            GPUForgetMult.configured_gpus[torch.cuda.current_device()] = (ctx.forget_mult, ctx.bwd_forget_mult, ctx.stream)
 
-        self.forget_mult, self.bwd_forget_mult, self.stream = GPUForgetMult.configured_gpus[torch.cuda.current_device()]
+        ctx.forget_mult, ctx.bwd_forget_mult, ctx.stream = GPUForgetMult.configured_gpus[torch.cuda.current_device()]
 
-    def forward(self, f, x, hidden_init=None):
-        self.compile()
+    @staticmethod
+    def forward(ctx, f, x, hidden_init=None):
+        GPUForgetMult.compile(ctx)
         seq_size, batch_size, hidden_size = f.size()
         result = f.new(seq_size + 1, batch_size, hidden_size)
         # We only zero the result array (result[0]) if we don't set a hidden initial state
@@ -127,25 +127,27 @@ class GPUForgetMult(torch.autograd.Function):
         ###
         grid_hidden_size = min(hidden_size, 512)
         grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
-        self.forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
-        self.save_for_backward(f, x, hidden_init)
-        self.result = result
+        ctx.forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), seq_size, batch_size, hidden_size], stream=ctx.stream)
+        ctx.save_for_backward(f, x, hidden_init)
+        ctx.result = result
         return result[1:, :, :]
 
-    def backward(self, grad_h):
-        self.compile()
-        f, x, hidden_init = self.saved_tensors
-        h = self.result
+    @staticmethod
+    def backward(ctx, grad_h):
+        GPUForgetMult.compile(ctx)
+        f, x, hidden_init = ctx.saved_tensors
+        h = ctx.result
         ###
         seq_size, batch_size, hidden_size = f.size()
         # Zeroing is not necessary as these will be overwritten
         grad_f = f.new(*f.size())
         grad_x = f.new(*f.size())
         grad_h_init = f.new(batch_size, hidden_size)
+        grad_h = grad_h.contiguous()
         ###
         grid_hidden_size = min(hidden_size, 512)
         grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
-        self.bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
+        ctx.bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), seq_size, batch_size, hidden_size], stream=ctx.stream)
         ###
         if hidden_init is not None:
             return grad_f, grad_x, grad_h_init
@@ -175,8 +177,8 @@ class ForgetMult(torch.nn.Module):
         if use_cuda: assert f.is_cuda and x.is_cuda, 'GPU ForgetMult with fast element-wise CUDA kernel requested but tensors not on GPU'
         ###
         # Avoiding 'RuntimeError: expected a Variable argument, but got NoneType' when hidden_init is None
-        if hidden_init is None: return GPUForgetMult()(f, x) if use_cuda else CPUForgetMult()(f, x)
-        return GPUForgetMult()(f, x, hidden_init) if use_cuda else CPUForgetMult()(f, x, hidden_init)
+        if hidden_init is None: return GPUForgetMult.apply(f, x) if use_cuda else CPUForgetMult()(f, x)
+        return GPUForgetMult.apply(f, x, hidden_init) if use_cuda else CPUForgetMult()(f, x, hidden_init)
 
 ###
 
@@ -202,10 +204,10 @@ if __name__ == '__main__':
     loss = resulta.pow(2).sum()
     loss.backward()
 
-    print('Result =', loss.data[0])
-    print('X grad =', a.grad.mean().data[0])
-    print('Forget grad =', forget.grad.mean().data[0])
-    print('Last H grad =', last_h.grad.mean().data[0])
+    print('Result =', loss.item())
+    print('X grad =', a.grad.mean().item())
+    print('Forget grad =', forget.grad.mean().item())
+    print('Last H grad =', last_h.grad.mean().item())
 
     x_grad_copy = a.grad.clone()
 
@@ -222,20 +224,20 @@ if __name__ == '__main__':
     loss = resultb.pow(2).sum()
     loss.backward()
 
-    print('Result =', loss.data[0])
-    print('X grad =', a.grad.mean().data[0])
-    print('Forget grad =', forget.grad.mean().data[0])
-    print('Last H grad =', last_h.grad.mean().data[0])
+    print('Result =', loss.item())
+    print('X grad =', a.grad.mean().item())
+    print('Forget grad =', forget.grad.mean().item())
+    print('Last H grad =', last_h.grad.mean().item())
 
     ###
 
     print()
     print('=-=-' * 5)
-    print('(Xgrad - Xgrad).sum() =', (x_grad_copy - a.grad).sum().data[0])
+    print('(Xgrad - Xgrad).sum() =', (x_grad_copy - a.grad).sum().item())
     print('Residual error for result')
     print('=-=-' * 5)
     residual = (resulta - resultb)
-    print(residual.abs().sum().data[0])
+    print(residual.abs().sum().item())
  
     # Had to loosen gradient checking, potentially due to general floating point badness?
     from torch.autograd import gradcheck

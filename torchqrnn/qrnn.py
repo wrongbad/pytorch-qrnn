@@ -108,7 +108,7 @@ class QRNNLayer(nn.Module):
         if self.window > 1 and self.save_prev_x:
             self.prevX = Variable(X[-1:, :, :].data, requires_grad=False)
 
-        return H, C[-1:, :, :]
+        return H, C[-1:, :, :].detach()
 
 
 class QRNN(torch.nn.Module):
